@@ -12,8 +12,12 @@ Reviewer Agent などへ拡張できる **Agent-to-Agent Communication Layer** �
 - Agent 数に依存しない(後から追加・削除してもシステムは壊れない)
 - 通信方式を差し替え可能(`Transport` 抽象。将来 WebSocket / message broker / A2A へ)
 - API キーはコードに書かず `.env` から読む(`.env` は git-ignore 済み)
-- 型安全(`mypy --strict` クリーン)、テスト付き(pytest 60件)
+- 型安全(`mypy --strict` クリーン)、テスト付き(pytest 99件)
 - **Director Agent** による動的タスク分解・委譲・再計画・統合(`agentcomm.orchestration`)
+- **検証・修正サイクル**: Question → Hypothesis → Execution → Critique(独立 Verifier)→ Refinement を
+  監査可能な構造化トレースとして記録(chain-of-thought は保存しない)
+
+> 開発状況の詳細(実装済 / 未実装 / 要確認 / 既知の問題 / 次の検討事項)は **[HANDOFF.md](HANDOFF.md)** を参照。
 
 ---
 
@@ -99,7 +103,10 @@ AI-Agent-Project/
 │   ├── orchestration/         # Director Agent / 動的プランニング(Agent 層の上位)
 │   │   ├── models.py          # Plan / SubTask / PlanEvent / SubTaskStatus / PlanStatus(JSON 化可)
 │   │   ├── planner.py         # Planner Protocol + SequentialPlanner / StaticPlanner / LLMPlanner
-│   │   └── director.py        # DirectorAgent: DAG 実行エンジン(依存解決・Agent 選択・再試行・再計画・統合)
+│   │   ├── director.py        # DirectorAgent: DAG 実行エンジン(依存解決・Agent 選択・再試行・再計画・統合)
+│   │   │                      #   + _solve_subtask(): Execution → Critique → Refinement サイクル
+│   │   ├── reasoning.py       # ReasoningTrace: Question / Hypothesis / ExecutionRecord / Critique / Refinement(監査用)
+│   │   └── verification.py    # Verifier(RuleBased / LLM / Agent / Composite)、RefinementPolicy
 │   └── llm/                   # LLM Adapter 層(通信層から独立)
 │       ├── base.py            # LLMAdapter 抽象 / ChatMessage / LLMResponse / HTTP ヘルパ
 │       ├── mock.py            # MockLLMAdapter(テスト・オフラインデモ用)
@@ -119,7 +126,9 @@ AI-Agent-Project/
 │   ├── test_agents.py         # A→B→A 往復、LLMAgent、Manager 階層、削除耐性、エラー耐性
 │   ├── test_llm.py            # 各 Adapter のペイロード生成・レスポンス解析(HTTP はモック)
 │   ├── test_orchestration_models.py  # Plan DAG(ready/blocked/validate/cycle)、JSON 往復、Planner 単体
-│   └── test_director.py       # Director MVP ワークフロー、並列 DAG、失敗/再試行/timeout/reject、LLMPlanner
+│   ├── test_director.py       # Director MVP ワークフロー、並列 DAG、失敗/再試行/timeout/reject、LLMPlanner
+│   └── test_verification.py   # 検証・修正サイクル(正常 / 修正 / REPLAN / 失敗 / 追跡 / 直列化)
+├── HANDOFF.md                 # 開発状況の記録(実装済 / 未実装 / 要確認 / 既知の問題 / 次の検討事項)
 ├── pyproject.toml             # パッケージ定義、pytest/mypy/ruff 設定
 ├── .env.example               # API キーのテンプレート(.env 自体はコミット禁止)
 └── .gitignore                 # .env / data/ などを除外
@@ -468,6 +477,86 @@ DirectorAgent(layer, info, MyPlanner(), worker_selector=cheapest)
 
 ---
 
+## 検証・修正サイクル(Critique / Refinement / ReasoningTrace)
+
+Director のサブタスク実行を、「実行して終わり」から「**独立した検証者が確認し、否なら修正・再実行・再計画**」へ拡張しています。
+`verifier` を指定しない場合(既定)は従来どおり検証なしで動作し、既存テスト 60 件は無変更で通過します。
+
+```
+Question → Hypothesis/Plan → Execution → Critique ──pass──▶ Final Result
+                                  ▲              │fail
+                                  └── Refinement ─┘  retry_same / reassign / gather_info / replan / accept / give_up
+```
+
+### 責務分割
+
+| コンポーネント | 役割 | 実装 |
+|---|---|---|
+| `DirectorAgent` | サイクルの制御フローのみ(判定はしない)。既存の retry / fail-over / replan / blocked-skip をそのまま利用 | `orchestration/director.py` `_solve_subtask()` |
+| `Planner` | 分解・再計画・統合(従来どおり) | `orchestration/planner.py` |
+| Worker Agent | 実行して結果を返すだけ。**自己評価はしない** | `agent.py`(変更なし) |
+| `Verifier` | Worker とは別の主体として `Critique` を返す。`RuleBasedVerifier` / `LLMVerifier` / **`AgentVerifier`(別 Agent に `review_request`)** / `CompositeVerifier` | `orchestration/verification.py` |
+| `RefinementPolicy` | fail した Critique に対する次の一手を選ぶ(`DefaultRefinementPolicy` は決定的ルール) | 同上 |
+| `ReasoningTrace` | 5 段階の**監査用記録**。`SubTask.reasoning` に保持され JSON 化される | `orchestration/reasoning.py` |
+
+**重要**: `ReasoningTrace` は Worker(LLM)の内部思考や chain-of-thought を保存するものではありません。
+Director 側が生成する「何を・誰が・どの message_id で・どう判定し・何を直したか」の要約です。
+Verifier へは「結論と根拠を固定 JSON で返し、私的な推論は含めない」と指示し、未知フィールドは取り込みません。
+
+### 使い方
+
+```python
+from agentcomm.orchestration import (
+    DirectorAgent, SequentialPlanner, AgentVerifier, RuleBasedVerifier, CompositeVerifier,
+    DefaultRefinementPolicy,
+)
+
+# Reviewer は普通の Agent(role="reviewer")。Worker 自身はレビュー候補から除外される
+reviewer = LLMAgent(layer, AgentInfo(id="reviewer", name="Reviewer", role="reviewer"),
+                    create_adapter("anthropic:claude-3-5-sonnet-latest"))
+
+director = DirectorAgent(
+    layer, AgentInfo(id="director", name="Director", role="director"),
+    SequentialPlanner(["researcher", "coder"]),
+    verifier=CompositeVerifier([RuleBasedVerifier(), AgentVerifier(layer, "director")]),
+    refinement_policy=DefaultRefinementPolicy(info_role="researcher", replan_after=2),
+    max_retries=1,        # 通信レベルの失敗（例外 / timeout）
+    max_refinements=2,    # Critique fail による再実行回数（subtask 単位）
+    max_rounds=5,         # 計画ラウンド（初回 + replan）
+)
+plan = await director.run("Build a rate limiter", task_id="t1", conversation_id="c1")
+st = plan.subtasks[0]
+st.verified_by            # 最終的に pass を出した verifier(例: "reviewer")
+st.attempts, st.refinements
+st.reasoning.critiques[0].issues[0].category   # IssueCategory.TEST_FAILURE など
+st.reasoning.executors(), st.reasoning.verifiers()
+```
+
+### Critique の構造
+
+```json
+{"verifier": "reviewer", "passed": false, "attempt": 1, "summary": "no tests", "confidence": 0.9,
+ "independent": true, "verifier_message_ids": ["msg_..review_request", "msg_..review_result"],
+ "issues": [{"category": "test_failure", "severity": "high", "summary": "no tests provided",
+             "evidence": "result has no test", "recommendation": "add tests"}]}
+```
+
+`category`: hallucination / fact_speculation_mix / logical_leap / missing_precondition / spec_mismatch /
+result_inconsistency / worker_failure / test_failure / omission / other　　`severity`: info / low / medium / high / critical
+
+### retry / fail-over / replan との関係
+
+| 層 | 何に対する対処か | 上限 | 実装 |
+|---|---|---|---|
+| retry / fail-over | 通信レベルの失敗(例外・timeout・rejected)| `max_retries` | 既存 `_run_subtask()`(変更: 記録と `extra` / `exclude` 引数のみ) |
+| Refinement | **内容**の否(Critique fail) | `max_refinements` | 新設 `_solve_subtask()`。`RETRY_SAME` / `REASSIGN` / `GATHER_INFO` は `_run_subtask()` を再呼び出し |
+| replan | 計画の否 | `max_rounds` | 既存 `_execute()` 末尾の `planner.replan()`。`RefinementAction.REPLAN` はサブタスクを `FAILED` にしてこの既存経路に委ねる(**間接接続**。詳細は HANDOFF.md §6) |
+
+`SequentialPlanner` / `StaticPlanner` の `replan()` は `[]` を返すため、これらを使う場合 REPLAN は実質 GIVE_UP と同じ結果になります。
+`LLMPlanner` は `render_results()` に含まれる Critique(却下理由)を見て代替タスクを提案できます。
+
+---
+
 ## LLM の接続方法
 
 `"provider:model"` 文字列で指定します。キーは環境変数(`.env`)から読まれます。
@@ -502,7 +591,7 @@ create_adapter("openai:llama3", base_url="http://localhost:11434/v1", api_key="n
 ## テスト方法
 
 ```bash
-pytest -q                    # 60 tests、外部 API 不要(1.3 秒程度)
+pytest -q                    # 99 tests、外部 API 不要(1.5 秒程度)
 mypy agentcomm               # --strict(pyproject.toml で設定)
 ruff check agentcomm tests examples
 ```
@@ -521,6 +610,14 @@ ruff check agentcomm tests examples
   - 並列ブランチ + join、欠員 role → failed / skipped、別 Agent へのフェイルオーバ、timeout で partial、
     `task_rejected`、Planner 例外・循環 DAG ・不正 JSON でも Director が落ちない、統合失敗のフォールバック
   - `LLMPlanner` の動的分解・未知 role の除去・再計画での追加タスク・同時複数 goal の分離追跡
+- **検証・修正サイクル**(`test_verification.py`、39 件)
+  - 正常系: Q → P → E → Critique(pass) → Final　/　verifier=None で従来動作
+  - 修正系: Critique(fail) → RETRY_SAME(構造化フィードバック)/ REASSIGN / GATHER_INFO / ACCEPT → 再実行 → pass
+  - REPLAN: 既存 `planner.replan()` 経路への接続、依存先 SKIPPED、`max_rounds`、Planner が空 / 不正な追加を返す場合
+  - 失敗系: fail 継続 → GIVE_UP、Worker 失敗、再実行失敗、Verifier 障害 / 不正 JSON / Reviewer 不在 / 自己レビュー禁止、
+    Planner 失敗、unknown dependency / cycle / self-dependency / 空 plan
+  - 追跡: conversation_id / task_id(`…:review`, `…:info`)維持、message_id が履歴に実在、Worker↔Verifier 関係、回数
+  - 直列化: ReasoningTrace / SubTask / Plan の JSON 往復、不正値の許容、旧形式互換、Reviewer の余分なフィールドが漏れない
 
 ---
 
@@ -541,6 +638,7 @@ ruff check agentcomm tests examples
 | 9 | Concurrency | Agent ごとに 1 受信タスク、`request()` は Future ベース、Manager は `gather` で並列委譲 | 1 Agent 内は逐次処理(順序保証・LLM レート制限に安全)。並列化したい場合は Agent を複数起動するか `handle` 内で task 化 |
 | 10 | Testing | MockLLM + HTTP モックで完全オフライン、async テスト | 実 API との結合テストは含めていない(コスト・鍵の都合)。examples で手動確認可能 |
 | 11 | Director / 動的計画 | **Planner(判断)と DirectorAgent(実行)を分離**。Director は `BaseAgent` として Agent 層に置き、既存の `request()` のみ使用 | 通信層・`ManagerAgent` は無変更。LLM なしで実行エンジンを決定的にテスト可。再計画は「追加のみ」に限定して暴走を防ぐ(書き換え・取消は今後) |
+| 12 | 検証・修正サイクル | **Verifier(判定)/ RefinementPolicy(次の一手)/ Director(制御)を分離**。Verifier は Worker と別主体(自己レビュー禁止)。トレースは監査用要約のみ | `verifier=None` で従来動作。Verifier 障害は「不合格」側に倒す(安全側だがコスト増)。REPLAN は既存 `replan()` への間接接続で、サブタスク単位の再計画 API は未実装 |
 
 ### 既知の制約
 
@@ -562,6 +660,8 @@ ruff check agentcomm tests examples
 2. **永続化の強化** — `SQLiteHistory` / `PostgresHistory`(`HistoryStore` を実装)、ack ベースの at-least-once 配送
 3. **Agent 側の高度化**
    - ~~`DirectorAgent`、動的プランニング~~ → **実装済**(`agentcomm.orchestration`)
+   - ~~検証・修正サイクル(独立 Verifier / Refinement)~~ → **実装済**。未実装の続き: Verifier を使う example、
+     実行系 Test Agent、サブタスク単位の再計画 API、Critique 履歴に基づく Worker 選択(HANDOFF.md §7・§9)
    - Director の発展: サブタスク単位の人間承認(HITL)、中間成果物の要約・アーティファクトストア、
      Director の入れ子(Director → Manager → Worker)、Worker から Director への途中報告(`STATUS`)の活用
    - role ごとの負荷分散(`worker_selector`)・コスト/品質基準の Agent 選択

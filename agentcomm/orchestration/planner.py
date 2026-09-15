@@ -62,6 +62,18 @@ def render_results(plan: Plan) -> str:
             lines.append(f"{head}\n{st.result}")
         else:
             lines.append(f"{head}\nERROR: {st.error or 'not executed'}")
+        # Structured review findings (if any) so a re-planner / synthesiser can
+        # react to *why* a result was rejected - conclusions only, no reasoning dump.
+        critique = st.reasoning.last_critique
+        if critique is not None and (critique.issues or not critique.passed):
+            verdict = "passed" if critique.passed else "FAILED"
+            lines.append(f"Review by {critique.verifier} (attempt {critique.attempt}): {verdict}"
+                         + (f" - {critique.summary}" if critique.summary else ""))
+            for issue in critique.issues:
+                line = f"  - [{issue.severity.value}/{issue.category.value}] {issue.summary}"
+                if issue.recommendation:
+                    line += f" -> {issue.recommendation}"
+                lines.append(line)
     return "\n".join(lines)
 
 

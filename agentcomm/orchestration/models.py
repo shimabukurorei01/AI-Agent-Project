@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any
 
 from ..models import new_id, utc_now
+from .reasoning import ReasoningTrace
 
 
 class SubTaskStatus(str, Enum):
@@ -49,16 +50,27 @@ class SubTask:
     started_at: str | None = None
     finished_at: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    verified_by: str | None = None  # verifier that issued the final passing critique
+    reasoning: ReasoningTrace = field(default_factory=ReasoningTrace)
+
+    @property
+    def refinements(self) -> int:
+        """Number of critique-driven refinements applied to this sub-task."""
+        return self.reasoning.refinement_count
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
         d["status"] = self.status.value
+        d["reasoning"] = self.reasoning.to_dict()
+        d["refinements"] = self.refinements
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> SubTask:
         data = dict(data)
+        data.pop("refinements", None)  # derived field
         data["status"] = SubTaskStatus(data.get("status", SubTaskStatus.PENDING))
+        data["reasoning"] = ReasoningTrace.from_dict(data.get("reasoning"))
         return cls(**data)
 
 
